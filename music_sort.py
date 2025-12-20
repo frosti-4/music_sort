@@ -170,7 +170,7 @@ def rename(audio_files_info,output_dir):
         else:
             print(f"{dest} уже переименован. Пропущено.")
     else:
-        Print("Неизвестно название или исполнитель. Переименование не выполнено")
+        print("Неизвестно название или исполнитель. Переименование не выполнено")
     for info in audio_files_info:
         info["Путь к файлу"] = dest
 def organize_by_artist(audio_files_info, base_output_directory):
@@ -273,8 +273,6 @@ def main():
 
     print(f"Сканирование директории: {scan_directory} и всех поддиректорий...\n")
 
-    if args.output_dir and not args.sort or not args.rename:
-        print("\nПредупреждение: Указана --output-dir, но флаг --sort или --rename не установлен.")
     audio_extensions = ('.mp3', '.flac', '.ogg', '.oga', '.m4a', '.mp4', '.wma')
     all_audio_info = []
     found_audio_files = False
