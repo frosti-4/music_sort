@@ -171,7 +171,8 @@ def rename(audio_files_info,output_dir):
             print(f"{dest} уже переименован. Пропущено.")
     else:
         print("Неизвестно название или исполнитель. Переименование не выполнено")
-    for info in audio_files_info:
+    for info in audio_files_info: #отвечаю тут где то костыли
+        dest = str
         info["Путь к файлу"] = dest
 def organize_by_artist(audio_files_info, base_output_directory):
     """
