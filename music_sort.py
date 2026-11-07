@@ -1,6 +1,9 @@
 import os
 import argparse
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
 from mutagen.mp3 import MP3
 from mutagen.flac import FLAC
 from mutagen.oggvorbis import OggVorbis
@@ -8,6 +11,18 @@ from mutagen.mp4 import MP4
 from mutagen.asf import ASF
 from mutagen.id3 import ID3NoHeaderError, ID3
 from mutagen import MutagenError
+
+# Максимум потоков сканирования (подстраивается под число ядер CPU)
+_scanner_lock = threading.Lock()
+_NUM_THREADS = None
+
+
+def _get_num_threads():
+    """Возвращает оптимальное число потоков для сканирования."""
+    global _NUM_THREADS
+    if _NUM_THREADS is None:
+        _NUM_THREADS = os.cpu_count() or 1
+    return _NUM_THREADS
 
 def get_audio_info(file_path):
     """
@@ -38,44 +53,40 @@ def get_audio_info(file_path):
         elif file_extension == '.flac':
             audio = FLAC(file_path)
             info["Тип файла"] = ".flac"
-        elif file_extension == '.ogg' or file_extension == '.oga':
+        elif file_extension in ('.ogg', '.oga'):
             audio = OggVorbis(file_path)
             info["Тип файла"] = ".ogg"
-        elif file_extension == '.oga':
-            audio = OggVorbis(file_path)
-            info["Тип файла"] = ".oga"
         elif file_extension == '.mp4':
             audio = MP4(file_path)
             info["Тип файла"] = '.mp4'
+        elif file_extension in ('.m4a', '.mp4'):
+            audio = MP4(file_path)
+            info["Тип файла"] = '.m4a'
         elif file_extension == '.wma':
             audio = ASF(file_path)
-            info["Тип файла"] = ".wma"
+            info["Тип файл"] = ".wma"
         else:
             info["Ошибка"] = "Неподдерживаемый формат аудиофайла."
             return info
 
-        if audio:
-            # Извлечение длительности
-            if audio.info and hasattr(audio.info, 'length'):
-                info["Длительность (сек)"] = int(audio.info.length)
+        if audio and audio.info:
+            info["Длительность (сек)"] = int(audio.info.length)
 
-            # Извлечение тегов в зависимости от типа файла
+        if audio and audio.tags:
             if file_extension == '.mp3':
-                # MP3 (ID3 tags)
-                if 'TPE1' in audio.tags: # Artist
+                if 'TPE1' in audio.tags:
                     info["Исполнитель"] = str(audio.tags['TPE1'])
-                if 'TIT2' in audio.tags: # Title
+                if 'TIT2' in audio.tags:
                     info["Название"] = str(audio.tags['TIT2'])
-                if 'TALB' in audio.tags: # Album
+                if 'TALB' in audio.tags:
                     info["Альбом"] = str(audio.tags['TALB'])
-                if 'TCON' in audio.tags: # Genre
+                if 'TCON' in audio.tags:
                     info["Жанр"] = str(audio.tags['TCON'])
-                if 'TDRC' in audio.tags: # Year (for ID3v2.4)
+                if 'TDRC' in audio.tags:
                     info["Год"] = str(audio.tags['TDRC'])
-                elif 'TYER' in audio.tags: # Year (for ID3v2.3)
+                elif 'TYER' in audio.tags:
                     info["Год"] = str(audio.tags['TYER'])
             elif file_extension in ['.flac', '.ogg', '.oga']:
-                # FLAC and Ogg Vorbis use similar tag structures
                 if 'artist' in audio.tags:
                     info["Исполнитель"] = ", ".join(audio.tags['artist'])
                 if 'title' in audio.tags:
@@ -86,20 +97,18 @@ def get_audio_info(file_path):
                     info["Жанр"] = ", ".join(audio.tags['genre'])
                 if 'date' in audio.tags:
                     info["Год"] = ", ".join(audio.tags['date'])
-            elif file_extension in ['.m4a', '.mp4']:
-                # M4A/MP4 (iTunes style tags)
-                if '\xa9ART' in audio.tags: # Artist
+            elif file_extension == '.mp4':
+                if '\xa9ART' in audio.tags:
                     info["Исполнитель"] = audio.tags['\xa9ART'][0]
-                if '\xa9nam' in audio.tags: # Title
+                if '\xa9nam' in audio.tags:
                     info["Название"] = audio.tags['\xa9nam'][0]
-                if '\xa9alb' in audio.tags: # Album
+                if '\xa9alb' in audio.tags:
                     info["Альбом"] = audio.tags['\xa9alb'][0]
-                if '\xa9gen' in audio.tags: # Genre
+                if '\xa9gen' in audio.tags:
                     info["Жанр"] = audio.tags['\xa9gen'][0]
-                if '\xa9day' in audio.tags: # Year
+                if '\xa9day' in audio.tags:
                     info["Год"] = audio.tags['\xa9day'][0]
             elif file_extension == '.wma':
-                # WMA (ASF tags)
                 if 'Author' in audio.tags:
                     info["Исполнитель"] = audio.tags['Author'][0].value
                 if 'Title' in audio.tags:
@@ -147,82 +156,92 @@ def list_all_artists(artists_list):
     else:
         print("\nИсполнители не найдены в отсканированных аудиофайлах.")
 
-def rename(audio_files_info,output_dir):
-    for info in audio_files_info:
-        artist=info.get("Исполнитель")
-        name=info.get("Название")
-        direct=info.get("Директория")
-        path=info.get("Путь к файлу")
-        ext=info.get("Тип файла")
-        #Очистка от недопустимых символов
-        invalid_chars = '<>:"/\\|?*'
-        for char in invalid_chars:
-            artist = artist.replace(char, '_')
-            name = name.replace(char, '_')
-        artist = artist.replace(' ', '_')
-        name = name.replace(' ', '_')
-    if name != "Неизвестно" or artist != "Неизвестно":
-        source=path
-        dest=(f"{direct}/{name}-{artist}{ext}")
-        if dest != source:
-            print(f"\nИнициированано переимнование {path}")
-            os.rename(source,dest)
+
+def sanitize_filename(name):
+    """Удаляет недопустимые символы из имени файла/папки."""
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        name = name.replace(char, '_')
+    return name.replace(' ', '_')
+
+def rename(files, output_dir):
+    """Переименовывает файлы в формате 'Название-Исполнитель'."""
+    print(f"\n--- Переименование треков ---")
+    renamed_count = 0
+
+    for info in files:
+        artist = info.get("Исполнитель") or "Неизвестно"
+        name = info.get("Название") or "Неизвестно"
+        path = info.get("Путь к файлу")
+        ext = info.get("Тип файла")
+        direct = info.get("Директория")
+
+        if path and not os.path.exists(path):
+            print(f"Пропущено '{info.get('Название файла')}': файл не найден.")
+            continue
+
+        artist = sanitize_filename(artist)
+        name = sanitize_filename(name)
+
+        if name != "Неизвестно" or artist != "Неизвестно":
+            source = path
+            dest = os.path.join(direct, f"{name}-{artist}{ext}")
+            if dest != source:
+                print(f"Переименовано: {path}")
+                os.rename(source, dest)
+                info["Путь к файлу"] = dest
+                renamed_count += 1
+            else:
+                print(f"Пропущено '{info.get('Название файла')}' (уже в нужном имени).")
         else:
-            print(f"{dest} уже переименован. Пропущено.")
-    else:
-        print("Неизвестно название или исполнитель. Переименование не выполнено")
-    for info in audio_files_info: #отвечаю тут где то костыли
-        dest = str
-        info["Путь к файлу"] = dest
-def organize_by_artist(audio_files_info, base_output_directory):
+            print(f"Пропущено '{info.get('Название файла')}': неизвестно название или исполнитель.")
+
+    print(f"\nПереименовано файлов: {renamed_count}")
+    print("-" * 30)
+
+
+def organize_by_artist(files, base_output_directory):
     """
     Создает папки для исполнителей и перемещает в них соответствующие треки.
     """
     print(f"\n--- Организация треков по исполнителям в директории: {base_output_directory} ---")
 
-    # Создаем базовую выходную директорию, если она не существует
     os.makedirs(base_output_directory, exist_ok=True)
 
     moved_count = 0
-    for info in audio_files_info:
+    for info in files:
         artist = info.get("Исполнитель")
         original_path = info.get("Путь к файлу")
         file_name = info.get("Название файла")
 
-        if artist and artist != "Неизвестно" and original_path and os.path.exists(original_path):
-            # Используем первый найденный исполнитель для имени папки
-            main_artist = artist.split(',')[0].strip()
-            
-            # Очищаем имя папки от недопустимых символов
-            invalid_chars = '<>:"/\\|?*'
-            for char in invalid_chars:
-                main_artist = main_artist.replace(char, '_')
-            main_artist = main_artist.replace(' ', '_')
-
-            artist_folder_path = os.path.join(base_output_directory, main_artist)
-            
-            # Создаем папку для исполнителя
-            os.makedirs(artist_folder_path, exist_ok=True)
-
-            destination_path = os.path.join(artist_folder_path, file_name)
-
-            try:
-                # Проверяем, не находится ли файл уже в целевой директории
-                if os.path.abspath(original_path) == os.path.abspath(destination_path):
-                    print(f"Файл '{file_name}' уже находится в целевой директории '{artist_folder_path}'. Пропущено.")
-                    continue
-                
-                shutil.move(original_path, destination_path)
-                print(f"Перемещено: '{file_name}' из '{os.path.dirname(original_path)}' в '{artist_folder_path}'")
-                moved_count += 1
-            except shutil.Error as e:
-                print(f"Ошибка при перемещении файла '{file_name}': {e}")
-            except Exception as e:
-                print(f"Неизвестная ошибка при перемещении файла '{file_name}': {e}")
-        elif not (artist and artist != "Неизвестно"):
+        if not (artist and artist != "Неизвестно"):
             print(f"Пропущено '{file_name}': Неизвестный исполнитель.")
-        else:
-            print(f"Пропущено '{file_name}': Файл не найден или путь некорректен: {original_path}")
+            continue
+        if not original_path or not os.path.exists(original_path):
+            print(f"Пропущено '{file_name}': файл не найден или путь некорректен: {original_path}")
+            continue
+
+        main_artist = artist.split(',')[0].strip()
+        main_artist = sanitize_filename(main_artist)
+
+        artist_folder_path = os.path.join(base_output_directory, main_artist)
+        os.makedirs(artist_folder_path, exist_ok=True)
+
+        destination_path = os.path.join(artist_folder_path, file_name)
+
+        try:
+            if os.path.abspath(original_path) == os.path.abspath(destination_path):
+                print(f"Файл '{file_name}' уже находится в целевой директории '{artist_folder_path}'. Пропущено.")
+                continue
+
+            shutil.move(original_path, destination_path)
+            print(f"Перемещено: '{file_name}' из '{os.path.dirname(original_path)}' в '{artist_folder_path}'")
+            info["Путь к файлу"] = destination_path
+            moved_count += 1
+        except shutil.Error as e:
+            print(f"Ошибка при перемещении файла '{file_name}': {e}")
+        except Exception as e:
+            print(f"Неизвестная ошибка при перемещении файла '{file_name}': {e}")
 
     if moved_count > 0:
         print(f"\nУспешно перемещено {moved_count} треков.")
@@ -265,7 +284,6 @@ def main():
     args = parser.parse_args()
 
     scan_directory = args.input_dir
-    # Если --output-dir не указан, используем input-dir в качестве базовой директории для создания папок исполнителей
     base_output_directory = args.output_dir if args.output_dir else scan_directory
 
     if not os.path.isdir(scan_directory):
@@ -277,47 +295,47 @@ def main():
     audio_extensions = ('.mp3', '.flac', '.ogg', '.oga', '.m4a', '.mp4', '.wma')
     all_audio_info = []
     found_audio_files = False
+
+    # --- 1. Сканирование файлов ---
+    files_to_scan = []
     for root, dirs, files in os.walk(scan_directory):
         for item in files:
             file_path = os.path.join(root, item)
             if item.lower().endswith(audio_extensions):
+                files_to_scan.append(file_path)
                 found_audio_files = True
-                info = get_audio_info(file_path)
+
+    if found_audio_files:
+        # --- 2. Параллельное извлечение метаданных ---
+        print(f"Найдено {len(files_to_scan)} аудиофайлов. Извлекаю метаданные...\n")
+        with ThreadPoolExecutor(max_workers=_get_num_threads()) as executor:
+            for info in executor.map(get_audio_info, files_to_scan):
                 all_audio_info.append(info)
-                # Выводим информацию о каждом файле только если не выполняем сортировку
-                if not args.sort and not args.rename:
-                    print(f"--- Информация о файле: {file_path} ---")
-                    for key, value in info.items():
-                        print(f"  {key}: {value}")
-                    print("-" * 30)
 
+        # --- 3. Вывод информации о каждом файле (если не сортировка/переименование) ---
+        if not args.sort and not args.rename:
+            for info in all_audio_info:
+                print(f"--- Информация о файле: {info.get('Путь к файлу')} ---")
+                for key, value in info.items():
+                    print(f"  {key}: {value}")
+                print("-" * 30)
 
-    if not found_audio_files:
+        # --- 4. Переименование ---
+        if args.rename:
+            rename(all_audio_info, base_output_directory)
+
+        # --- 5. Сортировка по исполнителям ---
+        if args.sort:
+            organize_by_artist(all_audio_info, base_output_directory)
+    else:
         print("Аудиофайлы не найдены в указанной директории или ее поддиректориях.")
         print("Убедитесь, что в этой директории или ее поддиректориях есть файлы с расширениями:")
         print(f"{', '.join(audio_extensions)}")
         print("Или поместите несколько аудиофайлов для тестирования.")
-    else:
-        # Выполняем сортировку, если флаг --sort установлен
-        if args.sort:
-            print(f"\nИнициирована сортировка треков по исполнителям.")
-            organize_by_artist(all_audio_info, base_output_directory)
-        # Переименование, если флаг --rename установлен
-        for root, dirs, files in os.walk(base_output_directory):
-            for item in files:
-                file_path = os.path.join(root, item)
-                if item.lower().endswith(audio_extensions):
-                    found_audio_files = True
-                    info = get_audio_info(file_path)
-                    all_audio_info.append(info)
-                    if args.rename:
-                        rename(all_audio_info,base_output_directory)
-           
-        # Всегда выводим список всех исполнителей
-        artists_list = get_unique_artists(all_audio_info)
-        list_all_artists(artists_list)
+
+    # --- 6. Список всех исполнителей ---
+    artists_list = get_unique_artists(all_audio_info)
+    list_all_artists(artists_list)
 
 if __name__ == "__main__":
     main()
-#ну сами уже поняли что нейронки юзал
-#тг автора @FRST4
